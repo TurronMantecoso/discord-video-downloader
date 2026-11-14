@@ -56,6 +56,33 @@ nombre y tamaño se omiten. Cada nombre incluye el ID del adjunto para evitar
 colisiones; algunos caracteres se sustituyen para permitir su uso en Windows
 y Linux.
 
+## Videos duplicados
+
+Durante la descarga se calcula la huella **SHA-256** por bloques. Si coincide
+con la de un archivo completo de la misma carpeta del canal, se conserva la
+copia existente y se elimina únicamente el archivo temporal recién descargado.
+Esto funciona aunque los videos tengan nombres distintos o estén en mensajes
+distintos. Tener el mismo tamaño por sí solo no los convierte en duplicados.
+
+El resumen distingue **descargados**, **omitidos**, **duplicados** y **fallidos**.
+El porcentaje incluye los bytes transferidos de los duplicados: la primera
+vez hay que descargarlos para conocer su huella. El total y el peso mostrados
+antes de descargar incluyen todos los adjuntos; todavía no se conocen los
+duplicados nuevos.
+
+El archivo `.huellas.json`, dentro de la carpeta del canal, guarda la relación
+entre cada adjunto y la copia conservada. En las siguientes ejecuciones, los
+duplicados ya reconocidos se cuentan como omitidos y no se descargan otra vez.
+Se vuelven a comprobar las huellas de los archivos locales antes de empezar;
+esto puede tardar si hay muchos videos. Si la copia se borró o modificó,
+sus referencias anteriores dejan de omitirse. Si se pierde el registro, se
+reconstruye desde los archivos, pero habrá que reconocer de nuevo los adjuntos
+duplicados que no tengan su propio archivo.
+
+La comparación abarca la carpeta del canal elegida. No elimina duplicados
+que ya estuvieran guardados antes de esta actualización. Videos recortados,
+recomprimidos o con metadatos distintos tienen huellas distintas.
+
 `Ctrl+C` detiene el programa conservando los videos completos. Los archivos
 `.part` se reinician al repetir la descarga. Si falla un video, se continúa
 con los demás; si falla el disco, se detiene la tarea. Una descarga con

@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import io
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -80,7 +82,7 @@ class ConsolaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Peso total:', self.consola.getvalue())
 
     def test_destino_y_omitidos(self):
-        destino, pendientes = ejemplo.preparar_destino(self.destino, 123, [self.video])
+        destino, pendientes, _ = ejemplo.preparar_destino(self.destino, 123, [self.video])
         self.assertEqual(destino, self.destino / '123')
         self.assertEqual(pendientes, [self.video])
         (destino / self.video.nombre_archivo).write_bytes(b'abcd')
@@ -129,6 +131,78 @@ class ConsolaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.get.call_count, 2)
         self.assertEqual(resultado.descargados, 1)
         self.assertEqual((self.destino / self.video.nombre_archivo).read_bytes(), b'abcd')
+        registro = json.loads((self.destino / '.huellas.json').read_text())
+        self.assertEqual(registro['adjuntos']['10']['sha256'], hashlib.sha256(b'abcd').hexdigest())
+
+    async def test_duplicados_en_mensajes_distintos(self):
+        otro = ejemplo.Video(2, 11, 'otro_nombre.mp4', 4, self.video.url)
+        resultado, _ = await self.descargar([respuesta(), respuesta()], [self.video, otro])
+        self.assertEqual((resultado.descargados, resultado.duplicados, resultado.fallidos), (1, 1, 0))
+        self.assertEqual(resultado.bytes_descargados, 8)
+        self.assertTrue((self.destino / self.video.nombre_archivo).exists())
+        self.assertFalse((self.destino / otro.nombre_archivo).exists())
+        self.assertFalse(list(self.destino.glob('*.part')))
+        self.assertIn('Duplicados: 1', self.consola.getvalue())
+        self.assertIn('100.00%', self.consola.getvalue())
+        self.assertIn('Sin procesar: 0', self.consola.getvalue())
+        registro = ejemplo.RegistroHuellas(self.destino)
+        self.assertTrue(registro.contiene(otro))
+        self.assertEqual(registro.adjuntos['11']['archivo'], self.video.nombre_archivo)
+
+    async def test_mismo_tamano_contenido_distinto(self):
+        otro = ejemplo.Video(2, 11, 'clip.mp4', 4, self.video.url)
+        resultado, _ = await self.descargar([respuesta(), respuesta([b'zzzz'])], [self.video, otro])
+        self.assertEqual((resultado.descargados, resultado.duplicados), (2, 0))
+        self.assertTrue((self.destino / otro.nombre_archivo).exists())
+
+    async def test_repetir_omite_adjuntos_duplicados_sin_red(self):
+        self.destino = self.destino / '123'
+        self.destino.mkdir()
+        otro = ejemplo.Video(2, 11, 'copia.mp4', 4, self.video.url)
+        await self.descargar([respuesta(), respuesta()], [self.video, otro])
+        _, pendientes, _ = ejemplo.preparar_destino(self.destino.parent, 123, [self.video, otro])
+        self.assertEqual(pendientes, [])
+
+    async def test_copia_borrada_no_omite_sus_duplicados(self):
+        self.destino = self.destino / '123'
+        self.destino.mkdir()
+        otro = ejemplo.Video(2, 11, 'copia.mp4', 4, self.video.url)
+        await self.descargar([respuesta(), respuesta()], [self.video, otro])
+        (self.destino / self.video.nombre_archivo).unlink()
+        _, pendientes, _ = ejemplo.preparar_destino(self.destino.parent, 123, [self.video, otro])
+        self.assertEqual(pendientes, [self.video, otro])
+
+    async def test_copia_modificada_no_omite_sus_duplicados(self):
+        otro = ejemplo.Video(2, 11, 'copia.mp4', 4, self.video.url)
+        await self.descargar([respuesta(), respuesta()], [self.video, otro])
+        (self.destino / self.video.nombre_archivo).write_bytes(b'zzzz')
+        registro = ejemplo.RegistroHuellas(self.destino)
+        self.assertFalse(registro.contiene(otro))
+
+    async def test_reconoce_archivos_de_version_anterior(self):
+        (self.destino / '99_anterior.mp4').write_bytes(b'abcd')
+        resultado, _ = await self.descargar([respuesta()])
+        self.assertEqual((resultado.descargados, resultado.duplicados), (0, 1))
+        self.assertFalse((self.destino / self.video.nombre_archivo).exists())
+        self.assertEqual((self.destino / '99_anterior.mp4').read_bytes(), b'abcd')
+
+    def test_registro_corrupto_se_reconstruye(self):
+        (self.destino / self.video.nombre_archivo).write_bytes(b'abcd')
+        (self.destino / '.huellas.json').write_text('{roto')
+        registro = ejemplo.RegistroHuellas(self.destino)
+        self.assertTrue(registro.contiene(self.video))
+        registro.guardar()
+        self.assertEqual(json.loads((self.destino / '.huellas.json').read_text())['version'], 1)
+
+    def test_guardado_atomico_conserva_registro_si_falla(self):
+        registro = ejemplo.RegistroHuellas(self.destino)
+        registro.guardar()
+        original = (self.destino / '.huellas.json').read_bytes()
+        with patch('ejemplo.json.dump', side_effect=OSError('disco lleno')):
+            with self.assertRaises(OSError):
+                registro.guardar()
+        self.assertEqual((self.destino / '.huellas.json').read_bytes(), original)
+        self.assertFalse(list(self.destino.glob('.huellas-*.tmp')))
 
     async def test_refresca_url(self):
         nuevo = adjunto()
@@ -184,7 +258,7 @@ class ConsolaTests(unittest.IsolatedAsyncioTestCase):
             pila.enter_context(patch('ejemplo.pedir_id', return_value=123))
             pila.enter_context(patch('ejemplo.analizar', AsyncMock(return_value=videos, side_effect=fallo)))
             confirmar = pila.enter_context(patch('ejemplo.confirmar', return_value=confirmacion))
-            destino = pila.enter_context(patch('ejemplo.pedir_destino', return_value=(self.destino, videos)))
+            destino = pila.enter_context(patch('ejemplo.pedir_destino', return_value=(self.destino, videos, None)))
             descargar = pila.enter_context(patch('ejemplo.descargar', AsyncMock()))
             await ejemplo.ejecutar('token-simulado')
         cliente.__aexit__.assert_awaited_once()
@@ -194,7 +268,7 @@ class ConsolaTests(unittest.IsolatedAsyncioTestCase):
         confirmar, destino, descargar = await self.ejecutar([self.video])
         confirmar.assert_called_once()
         destino.assert_called_once_with(123, [self.video])
-        descargar.assert_awaited_once_with(self.canal, self.destino, [self.video], 0)
+        descargar.assert_awaited_once_with(self.canal, self.destino, [self.video], 0, None)
 
     async def test_rechazo_no_pide_ruta(self):
         _, destino, descargar = await self.ejecutar([self.video], confirmacion=False)

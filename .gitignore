@@ -13,3 +13,5 @@ __pycache__/
 *.mkv
 *.avi
 *.m4v
+.huellas.json
+.huellas-*.tmp

@@ -1,6 +1,8 @@
 """Descarga interactiva de videos adjuntos de Discord a un disco local."""
 
 import asyncio
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -40,7 +42,93 @@ class Resultado:
     descargados: int = 0
     omitidos: int = 0
     fallidos: int = 0
+    duplicados: int = 0
     bytes_descargados: int = 0
+
+
+def huella_archivo(archivo):
+    huella = hashlib.sha256()
+    with archivo.open('rb') as entrada:
+        for bloque in iter(lambda: entrada.read(TAMANO_BLOQUE), b''):
+            huella.update(bloque)
+    return huella.hexdigest()
+
+
+class RegistroHuellas:
+    """Índice por carpeta: adjuntos de Discord y la copia local que conservamos."""
+
+    def __init__(self, destino):
+        self.destino = destino
+        self.ruta = destino / '.huellas.json'
+        self.adjuntos = {}
+        self.por_huella = {}
+        anteriores = {}
+        if self.ruta.is_symlink():
+            raise ValueError('El registro de huellas no puede ser un enlace simbólico.')
+        if self.ruta.exists():
+            try:
+                datos = json.loads(self.ruta.read_text(encoding='utf-8'))
+                if not isinstance(datos, dict) or datos.get('version') != 1 or not isinstance(datos.get('adjuntos'), dict):
+                    raise ValueError('Formato de registro desconocido.')
+                anteriores = datos['adjuntos']
+            except (ValueError, UnicodeError):
+                print('Registro de huellas inválido; se reconstruirá desde los archivos completos.')
+
+        # Recalcular permite incorporar descargas anteriores y descartar referencias
+        # a copias borradas o modificadas, sin confiar solamente en su tamaño.
+        print('Comprobando las huellas de los videos guardados...')
+        archivos = {}
+        for archivo in sorted(destino.iterdir()):
+            if not re.match(r'^\d+_', archivo.name) or archivo.name.endswith('.part'):
+                continue
+            if archivo.is_symlink() or not archivo.is_file():
+                continue
+            tamano = archivo.stat().st_size
+            huella = huella_archivo(archivo)
+            archivos[archivo.name] = (huella, tamano)
+            self.por_huella.setdefault((huella, tamano), archivo.name)
+            identificador = archivo.name.split('_', 1)[0]
+            self.adjuntos[identificador] = {'archivo': archivo.name, 'sha256': huella, 'tamano': tamano}
+
+        for identificador, registro in anteriores.items():
+            if not isinstance(registro, dict):
+                continue
+            nombre = registro.get('archivo')
+            if not isinstance(nombre, str):
+                continue
+            if nombre in archivos and archivos[nombre] == (registro.get('sha256'), registro.get('tamano')):
+                self.adjuntos.setdefault(identificador, registro)
+
+    def contiene(self, video):
+        registro = self.adjuntos.get(str(video.adjunto_id))
+        return registro is not None and registro['tamano'] == video.tamano
+
+    def copia_identica(self, huella, tamano):
+        nombre = self.por_huella.get((huella, tamano))
+        if nombre is None:
+            return None
+        archivo = self.destino / nombre
+        if archivo.is_symlink() or not archivo.is_file() or archivo.stat().st_size != tamano:
+            return None
+        if huella_archivo(archivo) != huella:
+            return None
+        return nombre
+
+    def registrar(self, video, huella, nombre):
+        self.adjuntos[str(video.adjunto_id)] = {'archivo': nombre, 'sha256': huella, 'tamano': video.tamano}
+        self.por_huella[(huella, video.tamano)] = nombre
+
+    def guardar(self):
+        temporal = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.destino,
+                                             prefix='.huellas-', suffix='.tmp', delete=False) as salida:
+                temporal = Path(salida.name)
+                json.dump({'version': 1, 'adjuntos': self.adjuntos}, salida, ensure_ascii=True, indent=2)
+            temporal.replace(self.ruta)
+        finally:
+            if temporal is not None and temporal.exists():
+                temporal.unlink()
 
 
 def es_video(adjunto):
@@ -94,6 +182,7 @@ async def analizar(canal):
 def preparar_destino(ruta, canal_id, videos):
     destino = Path(ruta).expanduser().resolve() / str(canal_id)
     destino.mkdir(parents=True, exist_ok=True)
+    registro = RegistroHuellas(destino)
     pendientes = []
     for video in videos:
         archivo = destino / video.nombre_archivo
@@ -103,7 +192,7 @@ def preparar_destino(ruta, canal_id, videos):
         if archivo.exists():
             if not archivo.is_file() or archivo.stat().st_size != video.tamano:
                 raise ValueError(f'Ya existe {video.nombre_archivo} con otro tamaño. Usa otra carpeta o retíralo.')
-        else:
+        elif not registro.contiene(video):
             pendientes.append(video)
     with tempfile.TemporaryFile(dir=destino) as prueba:
         prueba.write(b'prueba')
@@ -112,7 +201,8 @@ def preparar_destino(ruta, canal_id, videos):
     libres = shutil.disk_usage(destino).free
     if necesarios > libres:
         raise ValueError(f'Espacio insuficiente: se necesitan {peso(necesarios)} y hay {peso(libres)} libres.')
-    return destino, pendientes
+    registro.guardar()
+    return destino, pendientes, registro
 
 
 def pedir_destino(canal_id, videos):
@@ -145,22 +235,24 @@ class Progreso:
         if self.total_bytes:
             porcentaje = min(100, 100 * (completos + actuales) / self.total_bytes)
         else:
-            porcentaje = 100 if self.resultado.descargados == self.total_videos else 0
+            porcentaje = 100 if self.resultado.descargados + self.resultado.duplicados == self.total_videos else 0
         nombre = video.nombre_archivo[:55]
         print(
             f'\r{porcentaje:6.2f}% | Descargados: {self.resultado.descargados}/{self.total_videos}'
+            f' | Duplicados: {self.resultado.duplicados}'
             f' | Actual: {nombre:<55}',
             end='', flush=True,
         )
 
 
-async def descargar_video(session, canal, video, destino, progreso):
+async def descargar_video(session, canal, video, destino, progreso, registro):
     archivo = destino / video.nombre_archivo
     parcial = destino / (video.nombre_archivo + '.part')
     url = video.url
     actualizado = False
     for intento in range(3):
         recibidos = 0
+        huella = hashlib.sha256()
         try:
             # La sesión del CDN no lleva el token del bot.
             async with session.get(url) as respuesta:
@@ -179,11 +271,21 @@ async def descargar_video(session, canal, video, destino, progreso):
                         if recibidos > video.tamano:
                             raise ValueError('El contenido recibido supera el tamaño esperado.')
                         salida.write(bloque)
+                        huella.update(bloque)
                         progreso.mostrar(video, recibidos)
             if recibidos != video.tamano:
                 raise aiohttp.ClientPayloadError('El archivo recibido está incompleto.')
+            codigo = huella.hexdigest()
+            copia = registro.copia_identica(codigo, video.tamano)
+            if copia is not None:
+                registro.registrar(video, codigo, copia)
+                registro.guardar()
+                parcial.unlink()
+                return True
             parcial.replace(archivo)
-            return
+            registro.registrar(video, codigo, archivo.name)
+            registro.guardar()
+            return False
         except (aiohttp.ClientError, asyncio.TimeoutError, discord.HTTPException) as error:
             error_http = isinstance(error, (aiohttp.ClientResponseError, discord.HTTPException))
             transitorio = not error_http or error.status in (408, 429) or error.status >= 500
@@ -198,34 +300,42 @@ async def descargar_video(session, canal, video, destino, progreso):
 def mostrar_resumen(resultado, total, destino, estado):
     print(
         f'\n{estado}\nDescargados: {resultado.descargados} | Omitidos: {resultado.omitidos}'
-        f' | Fallidos: {resultado.fallidos}'
-        f' | Sin procesar: {total - resultado.descargados - resultado.omitidos - resultado.fallidos}'
+        f' | Duplicados: {resultado.duplicados} | Fallidos: {resultado.fallidos}'
+        f' | Sin procesar: {total - resultado.descargados - resultado.omitidos - resultado.duplicados - resultado.fallidos}'
         f'\nCarpeta: {destino}'
     )
 
 
-async def descargar(canal, destino, pendientes, omitidos):
+async def descargar(canal, destino, pendientes, omitidos, registro=None):
     resultado = Resultado(omitidos=omitidos)
     total = len(pendientes) + omitidos
     progreso = Progreso(sum(v.tamano for v in pendientes), len(pendientes), resultado)
     print(f'Omitidos: {omitidos} | Pendientes: {len(pendientes)} | Por descargar: {peso(progreso.total_bytes)}')
     timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=60)
     try:
+        if registro is None:
+            registro = RegistroHuellas(destino)
         async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
             for video in pendientes:
                 progreso.mostrar(video, 0, forzar=True)
                 try:
-                    await descargar_video(session, canal, video, destino, progreso)
+                    duplicado = await descargar_video(session, canal, video, destino, progreso, registro)
                 except (aiohttp.ClientError, asyncio.TimeoutError, discord.HTTPException, ValueError) as error:
                     resultado.fallidos += 1
                     progreso.mostrar(video, 0, forzar=True)
                     detalle = f'HTTP {error.status}' if isinstance(error, (aiohttp.ClientResponseError, discord.HTTPException)) else type(error).__name__
                     print(f'\nFalló: {video.nombre_archivo} ({detalle}).')
                     continue
-                resultado.descargados += 1
+                if duplicado:
+                    resultado.duplicados += 1
+                else:
+                    resultado.descargados += 1
                 resultado.bytes_descargados += video.tamano
                 progreso.mostrar(video, 0, forzar=True)
-                print(f'\nCompletado: {video.nombre_archivo}')
+                if duplicado:
+                    print(f'\nDuplicado: {video.nombre_archivo}. Se conserva la copia existente.')
+                else:
+                    print(f'\nCompletado: {video.nombre_archivo}')
     except OSError as error:
         resultado.fallidos += 1
         mostrar_resumen(resultado, total, destino, f'Descarga detenida por un error del disco: {error}')
@@ -271,8 +381,8 @@ async def ejecutar(token):
         if seleccion is None:
             print('Operación cancelada.')
             return
-        destino, pendientes = seleccion
-        await descargar(canal, destino, pendientes, len(videos) - len(pendientes))
+        destino, pendientes, registro = seleccion
+        await descargar(canal, destino, pendientes, len(videos) - len(pendientes), registro)
 
 
 def main():
